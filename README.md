@@ -322,6 +322,8 @@ Documentation for the [uploader](https://github.com/Cap-go/capacitor-uploader)
 * [`stop(...)`](#stop)
 * [`capture(...)`](#capture)
 * [`captureSample(...)`](#capturesample)
+* [`captureDownscaledSample(...)`](#capturedownscaledsample)
+* [`captureCroppedSample(...)`](#capturecroppedsample)
 * [`getSupportedFlashModes()`](#getsupportedflashmodes)
 * [`setAspectRatio(...)`](#setaspectratio)
 * [`getAspectRatio()`](#getaspectratio)
@@ -444,6 +446,44 @@ Captures a single frame from the camera preview stream.
 **Returns:** <code>Promise&lt;{ value: string; }&gt;</code>
 
 **Since:** 0.0.1
+
+--------------------
+
+
+### captureDownscaledSample(...)
+
+```typescript
+captureDownscaledSample(options: CameraDownscaledSampleOptions) => Promise<{ value: string; }>
+```
+
+NEW: Captures a downscaled sample.
+
+| Param         | Type                                                                                    |
+| ------------- | --------------------------------------------------------------------------------------- |
+| **`options`** | <code><a href="#cameradownscaledsampleoptions">CameraDownscaledSampleOptions</a></code> |
+
+**Returns:** <code>Promise&lt;{ value: string; }&gt;</code>
+
+**Since:** 7.27.0
+
+--------------------
+
+
+### captureCroppedSample(...)
+
+```typescript
+captureCroppedSample(options: CameraCroppedSampleOptions) => Promise<{ value: string; }>
+```
+
+NEW: Captures a cropped sample.
+
+| Param         | Type                                                                              |
+| ------------- | --------------------------------------------------------------------------------- |
+| **`options`** | <code><a href="#cameracroppedsampleoptions">CameraCroppedSampleOptions</a></code> |
+
+**Returns:** <code>Promise&lt;{ value: string; }&gt;</code>
+
+**Since:** 7.27.0
 
 --------------------
 
@@ -1128,6 +1168,26 @@ Defines the options for capturing a sample frame from the camera preview.
 | Prop          | Type                | Description                                        | Default         |
 | ------------- | ------------------- | -------------------------------------------------- | --------------- |
 | **`quality`** | <code>number</code> | The quality of the captured sample, from 0 to 100. | <code>85</code> |
+
+
+#### CameraDownscaledSampleOptions
+
+NEW: Options for downscaling
+
+| Prop          | Type                | Description                                                                        | Default         |
+| ------------- | ------------------- | ---------------------------------------------------------------------------------- | --------------- |
+| **`quality`** | <code>number</code> | The quality of the captured sample, from 0 to 100.                                 | <code>85</code> |
+| **`size`**    | <code>number</code> | The target size for the smallest side of the image. The aspect ratio is preserved. |                 |
+
+
+#### CameraCroppedSampleOptions
+
+NEW: Options for cropping
+
+| Prop          | Type                                                                  | Description                                        | Default         |
+| ------------- | --------------------------------------------------------------------- | -------------------------------------------------- | --------------- |
+| **`quality`** | <code>number</code>                                                   | The quality of the captured sample, from 0 to 100. | <code>85</code> |
+| **`coords`**  | <code>{ x: number; y: number; width: number; height: number; }</code> | The rectangle area to crop.                        |                 |
 
 
 #### CameraPermissionStatus

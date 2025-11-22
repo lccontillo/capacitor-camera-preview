@@ -4,7 +4,6 @@ import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
-import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -1687,49 +1686,50 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
     }
 
     // 4. Add captureCroppedSample implementation
-    public void captureCroppedSample(int quality, int x, int y, int reqWidth, int reqHeight) {
+// Pass the actual View object (e.g., your TextureView or FrameLayout container)
+    public void captureCroppedSample(int quality, int x, int y, int reqWidth, int reqHeight, View previewView) {
+        
+        // 1. Safety Check: Ensure View is laid out
+        if (previewView == null || previewView.getWidth() == 0) {
+            // If called too early (before layout pass), fall back to screen metrics
+            // or return an error.
+            return; 
+        }
+
         captureSampleInternal(quality, original -> {
             int imgW = original.getWidth();
             int imgH = original.getHeight();
 
-            // 1. Get Device Screen Dimensions
-            DisplayMetrics metrics = Resources.getSystem().getDisplayMetrics();
-            float screenW = metrics.widthPixels;
-            float screenH = metrics.heightPixels;
+            // 2. USE VIEW DIMENSIONS (The viewport)
+            // This matches exactly where the user tapped/dragged
+            float viewW = (float) previewView.getWidth();
+            float viewH = (float) previewView.getHeight();
 
-            // 2. Calculate Scale (Image pixels per Screen pixel)
-            // We use Math.min to replicate "object-fit: cover" behavior
-            float ratioX = (float) imgW / screenW;
-            float ratioY = (float) imgH / screenH;
+            // 3. Calculate Scale (Image pixels per View pixel)
+            float ratioX = (float) imgW / viewW;
+            float ratioY = (float) imgH / viewH;
             float scale = Math.min(ratioX, ratioY);
 
-            // 3. Calculate the Center Offsets
-            // How much of the image is hidden?
-            float visibleImgW = screenW * scale;
-            float visibleImgH = screenH * scale;
+            // 4. Center Offsets (Standard Center-Crop logic)
+            float visibleImgW = viewW * scale;
+            float visibleImgH = viewH * scale;
             
             float offsetX = (imgW - visibleImgW) / 2f;
             float offsetY = (imgH - visibleImgH) / 2f;
 
-            // 4. Map Viewport Coordinates to Image Coordinates
-            // We cast to int only at the very end to preserve precision
+            // 5. Map Coordinates
             int finalX = (int) ((x * scale) + offsetX);
             int finalY = (int) ((y * scale) + offsetY);
             int finalW = (int) (reqWidth * scale);
             int finalH = (int) (reqHeight * scale);
 
-            // 5. Safety Bounds (Critical in Android to prevent App Crash)
-            // Ensure we don't try to crop outside the image boundaries
+            // 6. Bounds Checking
             finalX = Math.max(0, finalX);
             finalY = Math.max(0, finalY);
-            
-            // Clamp width/height so (x + w) does not exceed image dimensions
             finalW = Math.min(finalW, imgW - finalX);
             finalH = Math.min(finalH, imgH - finalY);
 
-            if (finalW <= 0 || finalH <= 0) {
-                return original; // Fallback
-            }
+            if (finalW <= 0 || finalH <= 0) return original;
 
             return Bitmap.createBitmap(original, finalX, finalY, finalW, finalH);
         });
