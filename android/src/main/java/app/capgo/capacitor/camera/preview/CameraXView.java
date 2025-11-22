@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -1691,14 +1692,43 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
             int imgW = original.getWidth();
             int imgH = original.getHeight();
 
-            // Ensure crop is within bounds
-            int finalX = Math.max(0, x);
-            int finalY = Math.max(0, y);
-            int finalW = Math.min(reqWidth, imgW - finalX);
-            int finalH = Math.min(reqHeight, imgH - finalY);
+            // 1. Get Device Screen Dimensions
+            DisplayMetrics metrics = Resources.getSystem().getDisplayMetrics();
+            float screenW = metrics.widthPixels;
+            float screenH = metrics.heightPixels;
+
+            // 2. Calculate Scale (Image pixels per Screen pixel)
+            // We use Math.min to replicate "object-fit: cover" behavior
+            float ratioX = (float) imgW / screenW;
+            float ratioY = (float) imgH / screenH;
+            float scale = Math.min(ratioX, ratioY);
+
+            // 3. Calculate the Center Offsets
+            // How much of the image is hidden?
+            float visibleImgW = screenW * scale;
+            float visibleImgH = screenH * scale;
+            
+            float offsetX = (imgW - visibleImgW) / 2f;
+            float offsetY = (imgH - visibleImgH) / 2f;
+
+            // 4. Map Viewport Coordinates to Image Coordinates
+            // We cast to int only at the very end to preserve precision
+            int finalX = (int) ((x * scale) + offsetX);
+            int finalY = (int) ((y * scale) + offsetY);
+            int finalW = (int) (reqWidth * scale);
+            int finalH = (int) (reqHeight * scale);
+
+            // 5. Safety Bounds (Critical in Android to prevent App Crash)
+            // Ensure we don't try to crop outside the image boundaries
+            finalX = Math.max(0, finalX);
+            finalY = Math.max(0, finalY);
+            
+            // Clamp width/height so (x + w) does not exceed image dimensions
+            finalW = Math.min(finalW, imgW - finalX);
+            finalH = Math.min(finalH, imgH - finalY);
 
             if (finalW <= 0 || finalH <= 0) {
-                return original; // Fallback if coordinates are invalid
+                return original; // Fallback
             }
 
             return Bitmap.createBitmap(original, finalX, finalY, finalW, finalH);
