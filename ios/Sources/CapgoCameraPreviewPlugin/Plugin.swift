@@ -1549,36 +1549,104 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
     // 4. New Method: captureCroppedSample
     @objc func captureCroppedSample(_ call: CAPPluginCall) {
         let quality: Int = call.getInt("quality", 85)
-        guard let coords = call.getObject("coords") else {
-            call.reject("Coords object is required")
+        
+        // Validate Input Coordinates
+        guard let coords = call.getObject("coords"),
+            let x = coords["x"] as? Int,
+            let y = coords["y"] as? Int,
+            let width = coords["width"] as? Int,
+            let height = coords["height"] as? Int else {
+            call.reject("Valid coords object (x, y, width, height) is required")
             return
         }
-
-        let x = coords["x"] as? Int ?? 0
-        let y = coords["y"] as? Int ?? 0
-        let width = coords["width"] as? Int ?? 0
-        let height = coords["height"] as? Int ?? 0
 
         if width <= 0 || height <= 0 {
             call.reject("Invalid crop dimensions")
             return
         }
 
-        self.cameraController.captureSample { image, error in
-            guard var image = image else {
+        // 1. Get View Dimensions (The Viewport)
+        // We need to access the CALayer on the Main Thread to be safe
+        var viewWidth: CGFloat = 0
+        var viewHeight: CGFloat = 0
+        
+        DispatchQueue.main.sync {
+            if let layer = self.cameraController.previewLayer {
+                viewWidth = layer.bounds.width
+                viewHeight = layer.bounds.height
+            }
+        }
+
+        // Safety Check: Ensure View is laid out
+        if viewWidth == 0 || viewHeight == 0 {
+            call.reject("Preview layer not ready or has 0 dimensions")
+            return
+        }
+
+        // 2. Capture the Image
+        self.cameraController.captureSample { [weak self] image, error in
+            guard let self = self else { return }
+            
+            guard var originalImage = image else {
                 call.reject("Image capture error: \(String(describing: error))")
                 return
             }
 
             // Handle Front Camera Mirroring
             if self.cameraPosition == "front" {
-                image = image.withHorizontallyFlippedOrientation() ?? image
+                originalImage = originalImage.withHorizontallyFlippedOrientation() ?? originalImage
             }
 
-            // Crop logic
-            let rect = CGRect(x: x, y: y, width: width, height: height)
-            let croppedImage = image.crop(to: rect)
+            // 3. NORMALIZE ORIENTATION
+            // The Java math assumes the image pixel data is "upright" (0,0 is top-left).
+            // iOS camera buffers often come rotated with a metadata flag.
+            // We MUST bake the rotation into the pixels using your helper before doing math.
+            guard let fixedImage = originalImage.fixedOrientation() else {
+                call.reject("Failed to normalize image orientation")
+                return
+            }
 
+            let imgW = fixedImage.size.width
+            let imgH = fixedImage.size.height
+
+            // --- JAVA LOGIC PORT START ---
+
+            // 4. Calculate Scale (Image pixels per View pixel)
+            // Java: float ratioX = (float) imgW / viewW;
+            let ratioX = imgW / viewWidth
+            let ratioY = imgH / viewHeight
+            
+            // Java: float scale = Math.min(ratioX, ratioY);
+            // This matches logic for "AspectFill" (what CameraPreview usually uses)
+            let scale = min(ratioX, ratioY)
+
+            // 5. Center Offsets
+            // Java: float visibleImgW = viewW * scale;
+            let visibleImgW = viewWidth * scale
+            let visibleImgH = viewHeight * scale
+            
+            // Java: float offsetX = (imgW - visibleImgW) / 2f;
+            // This calculates how much of the image is "hanging off" the sides of the screen
+            let offsetX = (imgW - visibleImgW) / 2.0
+            let offsetY = (imgH - visibleImgH) / 2.0
+
+            // 6. Map Coordinates
+            // Convert the User's Tap coordinates (View Space) -> Camera Buffer coordinates (Image Space)
+            let finalX = (CGFloat(x) * scale) + offsetX
+            let finalY = (CGFloat(y) * scale) + offsetY
+            let finalW = CGFloat(width) * scale
+            let finalH = CGFloat(height) * scale
+
+            // --- JAVA LOGIC PORT END ---
+
+            // 7. Create Rect and Crop
+            // Your existing crop(to:) method handles the bounds checking (max(0, ...)),
+            // so we can pass the calculated rect directly.
+            let cropRect = CGRect(x: finalX, y: finalY, width: finalW, height: finalH)
+            
+            let croppedImage = fixedImage.crop(to: cropRect)
+
+            // 8. Resolve
             self.processAndResolve(call: call, image: croppedImage, quality: quality)
         }
     }
