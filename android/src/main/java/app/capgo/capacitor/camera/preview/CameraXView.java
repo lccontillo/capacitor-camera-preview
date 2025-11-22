@@ -157,6 +157,10 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
     private int activeOperations = 0;
     private boolean stopPending = false;
 
+    private interface BitmapProcessor {
+        Bitmap process(Bitmap original);
+    }
+
     private boolean IsOperationRunning(String name) {
         synchronized (operationLock) {
             if (stopPending) {
@@ -1659,49 +1663,99 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
     // we recompress JPEG in-memory and update EXIF info only in the returned JSON, not in the bytes.
 
     public void captureSample(int quality) {
-        if (sampleImageCapture == null) {
-            if (listener != null) {
-                listener.onSampleTakenError("Camera not ready");
+        captureSampleInternal(quality, bitmap -> bitmap); // No-op processor, returns original
+    }
+
+        // 3. Add captureDownscaledSample implementation
+    public void captureDownscaledSample(int quality, int targetMaxSize) {
+        captureSampleInternal(quality, original -> {
+            int width = original.getWidth();
+            int height = original.getHeight();
+            int smallestSide = Math.min(width, height);
+
+            if (smallestSide <= targetMaxSize) {
+                return original; // No need to upscale or resize
             }
+
+            float scale = (float) targetMaxSize / (float) smallestSide;
+            int newWidth = Math.round(width * scale);
+            int newHeight = Math.round(height * scale);
+
+            return Bitmap.createScaledBitmap(original, newWidth, newHeight, true);
+        });
+    }
+
+    // 4. Add captureCroppedSample implementation
+    public void captureCroppedSample(int quality, int x, int y, int reqWidth, int reqHeight) {
+        captureSampleInternal(quality, original -> {
+            int imgW = original.getWidth();
+            int imgH = original.getHeight();
+
+            // Ensure crop is within bounds
+            int finalX = Math.max(0, x);
+            int finalY = Math.max(0, y);
+            int finalW = Math.min(reqWidth, imgW - finalX);
+            int finalH = Math.min(reqHeight, imgH - finalY);
+
+            if (finalW <= 0 || finalH <= 0) {
+                return original; // Fallback if coordinates are invalid
+            }
+
+            return Bitmap.createBitmap(original, finalX, finalY, finalW, finalH);
+        });
+    }
+
+    // 5. The Core Internal Method
+    private void captureSampleInternal(int quality, BitmapProcessor processor) {
+        if (sampleImageCapture == null) {
+            if (listener != null) listener.onSampleTakenError("Camera not ready");
             return;
         }
 
         if (IsOperationRunning("captureSample")) {
-            Log.d(TAG, "captureSample: Ignored because stop is pending");
+            Log.d(TAG, "captureSample: Ignored because operation is running");
             return;
         }
-        Log.d(TAG, "captureSample: Starting sample capture with quality: " + quality);
 
-        boolean dispatched = false;
+        Log.d(TAG, "captureSample: Starting capture");
+
         try {
             sampleImageCapture.takePicture(
                 cameraExecutor,
                 new ImageCapture.OnImageCapturedCallback() {
                     @Override
                     public void onError(@NonNull ImageCaptureException exception) {
-                        Log.e(TAG, "captureSample: Sample capture failed", exception);
-                        if (listener != null) {
-                            listener.onSampleTakenError("Sample capture failed: " + exception.getMessage());
-                        }
+                        Log.e(TAG, "captureSample: Failed", exception);
+                        if (listener != null) listener.onSampleTakenError(exception.getMessage());
                         endOperation("captureSample");
                     }
 
                     @Override
                     public void onCaptureSuccess(@NonNull ImageProxy image) {
-                        //noinspection TryFinallyCanBeTryWithResources
                         try {
-                            // Convert ImageProxy to byte array
-                            byte[] bytes = imageProxyToByteArray(image);
+                            // 1. Convert ImageProxy to Bitmap (Handling Rotation)
+                            Bitmap bitmap = imageProxyToBitmap(image);
+                            
+                            // 2. Apply the specific logic (Downscale or Crop)
+                            Bitmap finalBitmap = processor.process(bitmap);
+
+                            // 3. Compress to Base64
+                            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                            finalBitmap.compress(Bitmap.CompressFormat.JPEG, quality, outputStream);
+                            byte[] bytes = outputStream.toByteArray();
                             String base64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+
+                            // 4. Cleanup
+                            if (bitmap != finalBitmap) bitmap.recycle();
+                            // We don't recycle finalBitmap immediately as GC handles it, 
+                            // but explicit recycling is good practice if memory is tight.
 
                             if (listener != null) {
                                 listener.onSampleTaken(base64);
                             }
                         } catch (Exception e) {
-                            Log.e(TAG, "captureSample: Error processing sample", e);
-                            if (listener != null) {
-                                listener.onSampleTakenError("Error processing sample: " + e.getMessage());
-                            }
+                            Log.e(TAG, "captureSample: Error processing", e);
+                            if (listener != null) listener.onSampleTakenError(e.getMessage());
                         } finally {
                             image.close();
                             endOperation("captureSample");
@@ -1709,19 +1763,38 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
                     }
                 }
             );
-
-            dispatched = true;
         } catch (Exception e) {
-            Log.e(TAG, "captureSample: Failed to start sample capture", e);
-            if (listener != null) {
-                listener.onSampleTakenError("Sample capture failed: " + e.getMessage());
-            }
-        } finally {
-            if (!dispatched) {
-                endOperation("captureSample");
-            }
+            Log.e(TAG, "captureSample: Start failed", e);
+            if (listener != null) listener.onSampleTakenError(e.getMessage());
+            endOperation("captureSample");
         }
     }
+
+    // 6. Helper to correctly convert ImageProxy to Bitmap with Rotation
+    private Bitmap imageProxyToBitmap(ImageProxy image) {
+        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+        byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+
+        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+
+        // Handle Rotation
+        int rotationDegrees = image.getImageInfo().getRotationDegrees();
+        if (rotationDegrees != 0) {
+            Matrix matrix = new Matrix();
+            matrix.postRotate(rotationDegrees);
+            Bitmap rotatedBitmap = Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true
+            );
+            // If createBitmap created a new instance, recycle the old one
+            if (rotatedBitmap != bitmap) {
+                bitmap.recycle();
+            }
+            return rotatedBitmap;
+        }
+        return bitmap;
+    }
+
 
     private byte[] imageProxyToByteArray(ImageProxy image) {
         ImageProxy.PlaneProxy[] planes = image.getPlanes();

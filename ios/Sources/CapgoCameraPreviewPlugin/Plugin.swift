@@ -28,6 +28,72 @@ extension UIWindow {
     }
 }
 
+// MARK: - Image Processing Extensions
+
+extension UIImage {
+    
+    // Helper to flip front camera images
+    func withHorizontallyFlippedOrientation() -> UIImage? {
+        guard let cgImage = self.cgImage else { return nil }
+        return UIImage(cgImage: cgImage, scale: self.scale, orientation: .upMirrored)
+    }
+
+    // Resize maintaining aspect ratio based on the shortest side
+    func resize(toShortSide targetSize: CGFloat) -> UIImage {
+        let currentWidth = self.size.width
+        let currentHeight = self.size.height
+        let smallestSide = min(currentWidth, currentHeight)
+
+        // If image is already smaller than target, return original
+        if smallestSide <= targetSize {
+            return self
+        }
+
+        let scale = targetSize / smallestSide
+        let newSize = CGSize(width: currentWidth * scale, height: currentHeight * scale)
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1 // Force 1.0 scale so pixels match dimensions exactly
+        let renderer = UIGraphicsImageRenderer(size: newSize, format: format)
+        
+        return renderer.image { _ in
+            self.draw(in: CGRect(origin: .zero, size: newSize))
+        }
+    }
+
+    // Crop to specific rectangle
+    func crop(to rect: CGRect) -> UIImage {
+        // Ensure the crop rect is within bounds
+        guard let cgImage = self.cgImage else { return self }
+        
+        // cgImage coordinates might not match UIImage size if scale != 1
+        // But usually for camera buffers scale is 1.0. 
+        // We treat the input coords as absolute pixel coordinates.
+        
+        let imgWidth = CGFloat(cgImage.width)
+        let imgHeight = CGFloat(cgImage.height)
+        
+        let finalX = max(0, rect.origin.x)
+        let finalY = max(0, rect.origin.y)
+        
+        // Calculate valid width/height
+        let finalWidth = min(rect.width, imgWidth - finalX)
+        let finalHeight = min(rect.height, imgHeight - finalY)
+        
+        if finalWidth <= 0 || finalHeight <= 0 {
+            return self
+        }
+        
+        let cropRect = CGRect(x: finalX, y: finalY, width: finalWidth, height: finalHeight)
+        
+        guard let croppedCgImage = cgImage.cropping(to: cropRect) else {
+            return self
+        }
+        
+        return UIImage(cgImage: croppedCgImage, scale: self.scale, orientation: self.imageOrientation)
+    }
+}
+
 /**
  * Please read the Capacitor iOS Plugin Development Guide
  * here: https://capacitor.ionicframework.com/docs/plugins/ios
@@ -43,6 +109,8 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "capture", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "captureSample", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "captureDownscaledSample", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "captureCroppedSample", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getSupportedFlashModes", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getHorizontalFov", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setFlashMode", returnType: CAPPluginReturnPromise),
@@ -1427,6 +1495,110 @@ public class CameraPreview: CAPPlugin, CAPBridgedPlugin, CLLocationManagerDelega
                     call.reject("Error writing image to file")
                 }
             }
+        }
+    }
+
+    // 2. Existing captureSample (kept for reference, you don't strictly need to change this, 
+    // but I recommend using the helper logic below to keep it consistent)
+    @objc func captureSample(_ call: CAPPluginCall) {
+        let quality: Int = call.getInt("quality", 85)
+        
+        self.cameraController.captureSample { image, error in
+            guard var image = image else {
+                call.reject("Image capture error: \(String(describing: error))")
+                return
+            }
+            
+            // Handle Front Camera Mirroring
+            if self.cameraPosition == "front" {
+                image = image.withHorizontallyFlippedOrientation() ?? image
+            }
+
+            self.processAndResolve(call: call, image: image, quality: quality)
+        }
+    }
+
+    // 3. New Method: captureDownscaledSample
+    @objc func captureDownscaledSample(_ call: CAPPluginCall) {
+        let quality: Int = call.getInt("quality", 85)
+        let size: Int = call.getInt("size", 0)
+
+        if size <= 0 {
+            call.reject("Invalid size parameter. Must be > 0")
+            return
+        }
+
+        self.cameraController.captureSample { image, error in
+            guard var image = image else {
+                call.reject("Image capture error: \(String(describing: error))")
+                return
+            }
+
+            // Handle Front Camera Mirroring
+            if self.cameraPosition == "front" {
+                image = image.withHorizontallyFlippedOrientation() ?? image
+            }
+
+            // Resize logic
+            let resizedImage = image.resize(toShortSide: CGFloat(size))
+            
+            self.processAndResolve(call: call, image: resizedImage, quality: quality)
+        }
+    }
+
+    // 4. New Method: captureCroppedSample
+    @objc func captureCroppedSample(_ call: CAPPluginCall) {
+        let quality: Int = call.getInt("quality", 85)
+        guard let coords = call.getObject("coords") else {
+            call.reject("Coords object is required")
+            return
+        }
+
+        let x = coords["x"] as? Int ?? 0
+        let y = coords["y"] as? Int ?? 0
+        let width = coords["width"] as? Int ?? 0
+        let height = coords["height"] as? Int ?? 0
+
+        if width <= 0 || height <= 0 {
+            call.reject("Invalid crop dimensions")
+            return
+        }
+
+        self.cameraController.captureSample { image, error in
+            guard var image = image else {
+                call.reject("Image capture error: \(String(describing: error))")
+                return
+            }
+
+            // Handle Front Camera Mirroring
+            if self.cameraPosition == "front" {
+                image = image.withHorizontallyFlippedOrientation() ?? image
+            }
+
+            // Crop logic
+            let rect = CGRect(x: x, y: y, width: width, height: height)
+            let croppedImage = image.crop(to: rect)
+
+            self.processAndResolve(call: call, image: croppedImage, quality: quality)
+        }
+    }
+
+    // Helper to reduce code duplication for encoding/saving
+    private func processAndResolve(call: CAPPluginCall, image: UIImage, quality: Int) {
+        let compression = CGFloat(quality) / 100.0
+        let imageData = image.jpegData(compressionQuality: compression)
+
+        if self.storeToFile == true {
+            do {
+                let fileUrl = self.getTempFilePath()
+                try imageData?.write(to: fileUrl)
+                call.resolve(["value": fileUrl.absoluteString])
+            } catch {
+                call.reject("Error writing image to file")
+            }
+        } else {
+            let imageBase64 = imageData?.base64EncodedString() ?? ""
+            call.resolve(["value": imageBase64])
         }
     }
 

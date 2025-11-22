@@ -380,6 +380,57 @@ public class CameraPreview extends Plugin implements CameraXView.CameraXViewList
     }
 
     @PluginMethod
+    public void captureDownscaledSample(PluginCall call) {
+        if (cameraXView == null || !cameraXView.isRunning()) {
+            call.reject("Camera is not running");
+            return;
+        }
+        bridge.saveCall(call);
+        sampleCallbackId = call.getCallbackId();
+        
+        Integer quality = Objects.requireNonNull(call.getInt("quality", 85));
+        Integer size = call.getInt("size", 0);
+
+        if (size <= 0) {
+            call.reject("Invalid size parameter. Must be > 0");
+            return;
+        }
+
+        cameraXView.captureDownscaledSample(quality, size);
+    }
+
+    @PluginMethod
+    public void captureCroppedSample(PluginCall call) {
+        if (cameraXView == null || !cameraXView.isRunning()) {
+            call.reject("Camera is not running");
+            return;
+        }
+        bridge.saveCall(call);
+        sampleCallbackId = call.getCallbackId();
+        
+        Integer quality = Objects.requireNonNull(call.getInt("quality", 85));
+        JSObject coords = call.getObject("coords");
+
+        if (coords == null) {
+            call.reject("Coords object is required");
+            return;
+        }
+
+        // Extract coordinates safely
+        int x = coords.getInteger("x", 0);
+        int y = coords.getInteger("y", 0);
+        int width = coords.getInteger("width", 0);
+        int height = coords.getInteger("height", 0);
+
+        if (width <= 0 || height <= 0) {
+            call.reject("Invalid crop dimensions");
+            return;
+        }
+
+        cameraXView.captureCroppedSample(quality, x, y, width, height);
+    }
+
+    @PluginMethod
     public void stop(final PluginCall call) {
         boolean force = Boolean.TRUE.equals(call.getBoolean("force", false));
 

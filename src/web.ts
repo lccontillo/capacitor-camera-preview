@@ -9,6 +9,8 @@ import type {
   CameraPreviewPictureOptions,
   CameraPreviewPlugin,
   CameraSampleOptions,
+  CameraDownscaledSampleOptions, 
+  CameraCroppedSampleOptions,
   CameraPermissionStatus,
   DeviceOrientation,
   GridMode,
@@ -639,6 +641,14 @@ export class CameraPreviewWeb extends WebPlugin implements CameraPreviewPlugin {
 
   async captureSample(_options: CameraSampleOptions): Promise<any> {
     return this.capture(_options);
+  }
+
+  async captureDownscaledSample(_options: CameraDownscaledSampleOptions): Promise<any> {
+    throw new Error('captureDownscaledSample not implemented on web');
+  }
+
+  async captureCroppedSample(_options: CameraCroppedSampleOptions): Promise<any> {
+    throw new Error('captureCroppedSample not implemented on web');
   }
 
   async stopRecordVideo(): Promise<any> {

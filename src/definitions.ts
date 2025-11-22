@@ -321,17 +321,6 @@ export interface SupportedPictureSizes {
 }
 
 /**
- * Defines the options for capturing a sample frame from the camera preview.
- */
-export interface CameraSampleOptions {
-  /**
-   * The quality of the captured sample, from 0 to 100.
-   * @default 85
-   */
-  quality?: number;
-}
-
-/**
  * The available flash modes for the camera.
  * 'torch' is a continuous light mode.
  */
@@ -349,6 +338,53 @@ export interface CameraOpacityOptions {
    * @default 1.0
    */
   opacity?: number;
+}
+
+/**
+ * Defines the options for capturing a sample frame from the camera preview.
+ */
+export interface CameraSampleOptions {
+  /**
+   * The quality of the captured sample, from 0 to 100.
+   * @default 85
+   */
+  quality?: number;
+}
+
+/** 
+ * NEW: Options for downscaling
+ */
+export interface CameraDownscaledSampleOptions {
+  /**
+   * The quality of the captured sample, from 0 to 100.
+   * @default 85
+   */
+  quality?: number;
+  /**
+   * The target size for the smallest side of the image.
+   * The aspect ratio is preserved.
+   */
+  size: number;
+}
+
+/** 
+ * NEW: Options for cropping
+ */
+export interface CameraCroppedSampleOptions {
+  /**
+   * The quality of the captured sample, from 0 to 100.
+   * @default 85
+   */
+  quality?: number;
+  /**
+   * The rectangle area to crop.
+   */
+  coords: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 /**
@@ -427,6 +463,21 @@ export interface CameraPreviewPlugin {
    * @since 0.0.1
    */
   captureSample(options: CameraSampleOptions): Promise<{ value: string }>;
+
+  /** 
+   * NEW: Captures a downscaled sample.
+   * @param {CameraDownscaledSampleOptions} options 
+   * @since 7.27.0
+   */
+
+  captureDownscaledSample(options: CameraDownscaledSampleOptions): Promise<{ value: string }>;
+
+  /** 
+   * NEW: Captures a cropped sample.
+   * @param {CameraCroppedSampleOptions} options 
+   * @since 7.27.0
+   */
+  captureCroppedSample(options: CameraCroppedSampleOptions): Promise<{ value: string }>;
 
   /**
    * Gets the flash modes supported by the active camera.
