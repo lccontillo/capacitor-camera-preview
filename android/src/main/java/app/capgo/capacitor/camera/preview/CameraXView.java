@@ -46,6 +46,7 @@ import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ExposureState;
 import androidx.camera.core.FocusMeteringAction;
 import androidx.camera.core.FocusMeteringResult;
+import androidx.camera.core.ImageAnalysis; // ADDED
 import androidx.camera.core.ImageCapture;
 import androidx.camera.core.ImageCaptureException;
 import androidx.camera.core.ImageProxy;
@@ -123,6 +124,7 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
     private Camera camera;
     private ImageCapture imageCapture;
     private ImageCapture sampleImageCapture;
+    private ImageAnalysis imageAnalysis; // ADDED: The silent stream processor
     private VideoCapture<Recorder> videoCapture;
     private Recording currentRecording;
     private File currentVideoFile;
@@ -156,6 +158,13 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
     private final Object operationLock = new Object();
     private int activeOperations = 0;
     private boolean stopPending = false;
+
+    // === NEW: ImageAnalysis Gatekeeping variables ===
+    private final Object analysisLock = new Object();
+    private volatile boolean captureNextFrame = false;
+    private volatile BitmapProcessor pendingProcessor = null;
+    private volatile int pendingQuality = 100;
+    // ================================================
 
     private interface BitmapProcessor {
         Bitmap process(Bitmap original);
@@ -721,219 +730,205 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
         webView.setBackgroundColor(android.graphics.Color.WHITE);
     }
 
-    @OptIn(markerClass = ExperimentalCamera2Interop.class)
+     @OptIn(markerClass = ExperimentalCamera2Interop.class)
     private void bindCameraUseCases() {
+        // 1. Safety Checks
         if (cameraProvider == null) return;
+        if (previewView == null) return;
+
+        // 2. Run on Main Thread (Lifecycle binding requires this)
         mainExecutor.execute(() -> {
             try {
-                Log.d(
-                    TAG,
-                    "Building camera selector with deviceId: " +
-                        sessionConfig.getDeviceId() +
-                        " and position: " +
-                        sessionConfig.getPosition()
-                );
+                // --- A. Configure Camera Selector ---
                 currentCameraSelector = buildCameraSelector();
 
-                ResolutionSelector.Builder resolutionSelectorBuilder = new ResolutionSelector.Builder().setResolutionStrategy(
-                    ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY
-                );
+                // --- B. Configure Resolution & Aspect Ratio ---
+                ResolutionSelector.Builder resolutionSelectorBuilder = new ResolutionSelector.Builder()
+                    .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY);
 
                 if (sessionConfig.getAspectRatio() != null) {
-                    int aspectRatio;
-                    if ("16:9".equals(sessionConfig.getAspectRatio())) {
-                        aspectRatio = AspectRatio.RATIO_16_9;
-                    } else {
-                        // "4:3"
-                        aspectRatio = AspectRatio.RATIO_4_3;
-                    }
+                    int aspectRatio = "16:9".equals(sessionConfig.getAspectRatio())
+                        ? AspectRatio.RATIO_16_9
+                        : AspectRatio.RATIO_4_3;
+
                     resolutionSelectorBuilder.setAspectRatioStrategy(
                         new AspectRatioStrategy(aspectRatio, AspectRatioStrategy.FALLBACK_RULE_AUTO)
                     );
                 }
-
                 ResolutionSelector resolutionSelector = resolutionSelectorBuilder.build();
 
-                int rotation = previewView != null && previewView.getDisplay() != null
+                // --- C. Get Rotation ---
+                int rotation = previewView.getDisplay() != null
                     ? previewView.getDisplay().getRotation()
                     : android.view.Surface.ROTATION_0;
 
-                Preview preview = new Preview.Builder().setResolutionSelector(resolutionSelector).setTargetRotation(rotation).build();
-                // Keep reference to preview use case for later re-binding (e.g., when enabling video)
+                // --- D. Build Preview Use Case ---
+                Preview preview = new Preview.Builder()
+                    .setResolutionSelector(resolutionSelector)
+                    .setTargetRotation(rotation)
+                    .build();
+
+                // --- E. Build ImageCapture Use Case (Standard/Loud) ---
+                // We keep this for high-res photos with Flash support
                 imageCapture = new ImageCapture.Builder()
                     .setResolutionSelector(resolutionSelector)
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .setFlashMode(currentFlashMode)
                     .setTargetRotation(rotation)
                     .build();
-                sampleImageCapture = imageCapture;
+                
+                sampleImageCapture = imageCapture; // KEEP for backward compatibility
 
-                // Only setup VideoCapture if enableVideoMode is true
+                // --- F. Build ImageAnalysis Use Case (Silent/Fast) ---
+                // This acts as the silent snapshot engine
+                imageAnalysis = new ImageAnalysis.Builder()
+                    .setResolutionSelector(resolutionSelector)
+                    // STRATEGY_KEEP_ONLY_LATEST prevents queue buildup.
+                    // If the analyzer is busy, new frames are dropped.
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888) // Direct Bitmap friendly
+                    .setTargetRotation(rotation)
+                    .build();
+
+                // Define the Analyzer (The "Worker")
+                imageAnalysis.setAnalyzer(cameraExecutor, imageProxy -> {
+                    synchronized (analysisLock) {
+                        // 1. GATEKEEPER: If no snapshot requested, discard immediately.
+                        if (!captureNextFrame) {
+                            imageProxy.close();
+                            return;
+                        }
+
+                        // 2. PROCESSING: Snapshot requested!
+                        try {
+                            Log.d(TAG, "ImageAnalysis: Processing requested frame");
+
+                            // Convert YUV/HardwareBuffer to Bitmap
+                            Bitmap bitmap = imageProxy.toBitmap();
+
+                            // Apply Crop/Resize if a processor was provided
+                            Bitmap finalBitmap = (pendingProcessor != null)
+                                ? pendingProcessor.process(bitmap)
+                                : bitmap;
+
+                            // Compress to Base64
+                            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                            finalBitmap.compress(Bitmap.CompressFormat.JPEG, pendingQuality, outputStream);
+                            byte[] bytes = outputStream.toByteArray();
+                            String base64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+
+                            // Memory Cleanup
+                            if (bitmap != finalBitmap) bitmap.recycle();
+
+                            // Return result to Capacitor/JS
+                            if (listener != null) {
+                                listener.onSampleTaken(base64);
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "ImageAnalysis processing error", e);
+                            if (listener != null) listener.onSampleTakenError(e.getMessage());
+                        } finally {
+                            // 3. RESET: Close the gate and the image
+                            captureNextFrame = false;
+                            pendingProcessor = null;
+                            imageProxy.close(); // CRITICAL: Must close to receive next frame
+                            endOperation("captureSample");
+                        }
+                    }
+                });
+
+                // --- G. Build VideoCapture (Optional) ---
                 if (sessionConfig.isVideoModeEnabled()) {
                     QualitySelector qualitySelector = QualitySelector.fromOrderedList(
                         Arrays.asList(Quality.FHD, Quality.HD, Quality.SD),
                         FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
                     );
-                    Recorder recorder = new Recorder.Builder().setQualitySelector(qualitySelector).build();
+                    Recorder recorder = new Recorder.Builder()
+                        .setQualitySelector(qualitySelector)
+                        .build();
                     videoCapture = VideoCapture.withOutput(recorder);
                 }
 
-                // Unbind any existing use cases and bind new ones
+                // --- H. BINDING LOGIC ---
+
+                // Unbind everything before rebinding
                 cameraProvider.unbindAll();
 
-                // Re-set the surface provider after unbinding to ensure the preview
-                // is connected and video frames are captured correctly
+                // Re-attach surface provider (needed after unbind)
                 preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
-                // Bind with or without video capture based on enableVideoMode
-                if (sessionConfig.isVideoModeEnabled() && videoCapture != null) {
-                    camera = cameraProvider.bindToLifecycle(this, currentCameraSelector, preview, imageCapture, videoCapture);
-                } else {
-                    camera = cameraProvider.bindToLifecycle(this, currentCameraSelector, preview, imageCapture);
+                try {
+                    if (sessionConfig.isVideoModeEnabled() && videoCapture != null) {
+                        // === VIDEO MODE ===
+                        // Bind: Preview + Video + Analysis
+                        // We exclude ImageCapture here. Most hardware cannot do 4 streams.
+                        // This allows recording video AND taking silent snapshots simultaneously.
+                        Log.d(TAG, "Binding: Video Mode (Preview + Video + Analysis)");
+                        camera = cameraProvider.bindToLifecycle(
+                            this,
+                            currentCameraSelector,
+                            preview,
+                            videoCapture,
+                            imageAnalysis
+                        );
+                    } else {
+                        // === PHOTO MODE ===
+                        // Bind: Preview + ImageCapture + Analysis
+                        // This allows standard photos (with flash) AND silent snapshots.
+                        Log.d(TAG, "Binding: Photo Mode (Preview + Capture + Analysis)");
+                        camera = cameraProvider.bindToLifecycle(
+                            this,
+                            currentCameraSelector,
+                            preview,
+                            imageCapture,
+                            imageAnalysis
+                        );
+                    }
+                } catch (IllegalArgumentException e) {
+                    // === FALLBACK FOR LEGACY DEVICES ===
+                    // Some older devices (Hardware Level: LEGACY) cannot handle 3 use cases.
+                    // If the 3-case bind fails, we drop ImageAnalysis to ensure the app at least starts.
+                    Log.e(TAG, "Hardware limit reached (3 use-cases failed). Falling back to basic binding.", e);
+
+                    cameraProvider.unbindAll();
+                    if (sessionConfig.isVideoModeEnabled() && videoCapture != null) {
+                        camera = cameraProvider.bindToLifecycle(this, currentCameraSelector, preview, videoCapture);
+                    } else {
+                        camera = cameraProvider.bindToLifecycle(this, currentCameraSelector, preview, imageCapture);
+                    }
+                    // Note: In this fallback state, captureSample() will fail nicely
+                    // because checks for (imageAnalysis == null) are in place.
                 }
 
+                // --- I. Post-Bind Configuration ---
                 resetExposureCompensationToDefault();
 
-                // Log details about the active camera
-                Log.d(TAG, "Use cases bound. Inspecting active camera and use cases.");
+                // Log Camera Info
                 CameraInfo cameraInfo = camera.getCameraInfo();
                 Log.d(TAG, "Bound Camera ID: " + Camera2CameraInfo.from(cameraInfo).getCameraId());
 
-                // Log zoom state
-                ZoomState zoomState = cameraInfo.getZoomState().getValue();
-                if (zoomState != null) {
-                    Log.d(
-                        TAG,
-                        "Active Zoom State: " +
-                            "min=" +
-                            zoomState.getMinZoomRatio() +
-                            ", " +
-                            "max=" +
-                            zoomState.getMaxZoomRatio() +
-                            ", " +
-                            "current=" +
-                            zoomState.getZoomRatio()
-                    );
-                }
-
-                // Log physical cameras of the active camera
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    Set<CameraInfo> physicalCameras = cameraInfo.getPhysicalCameraInfos();
-                    Log.d(TAG, "Active camera has " + physicalCameras.size() + " physical cameras.");
-                    for (CameraInfo physical : physicalCameras) {
-                        Log.d(TAG, "  - Physical camera ID: " + Camera2CameraInfo.from(physical).getCameraId());
-                    }
-                }
-
-                // Log resolution info
-                ResolutionInfo previewResolution = preview.getResolutionInfo();
-                if (previewResolution != null) {
-                    currentPreviewResolution = previewResolution.getResolution();
-                    Log.d(TAG, "Preview resolution: " + currentPreviewResolution);
-
-                    // Log the actual aspect ratio of the selected resolution
-                    if (currentPreviewResolution != null) {
-                        double actualRatio = (double) currentPreviewResolution.getWidth() / (double) currentPreviewResolution.getHeight();
-                        Log.d(
-                            TAG,
-                            "Actual preview aspect ratio: " +
-                                actualRatio +
-                                " (width=" +
-                                currentPreviewResolution.getWidth() +
-                                ", height=" +
-                                currentPreviewResolution.getHeight() +
-                                ")"
-                        );
-
-                        // Compare with requested ratio
-                        if ("4:3".equals(sessionConfig.getAspectRatio())) {
-                            double expectedRatio = 4.0 / 3.0;
-                            double difference = Math.abs(actualRatio - expectedRatio);
-                            Log.d(
-                                TAG,
-                                "4:3 ratio check - Expected: " + expectedRatio + ", Actual: " + actualRatio + ", Difference: " + difference
-                            );
-                        } else if ("16:9".equals(sessionConfig.getAspectRatio())) {
-                            double expectedRatio = 16.0 / 9.0;
-                            double difference = Math.abs(actualRatio - expectedRatio);
-                            Log.d(
-                                TAG,
-                                "16:9 ratio check - Expected: " + expectedRatio + ", Actual: " + actualRatio + ", Difference: " + difference
-                            );
-                        }
-                    }
-                }
-                ResolutionInfo imageCaptureResolution = imageCapture.getResolutionInfo();
-                if (imageCaptureResolution != null) {
-                    Log.d(TAG, "Image capture resolution: " + imageCaptureResolution.getResolution());
-                }
-
-                // Update scale type based on aspect ratio whenever (re)binding
+                // Apply Scale Type
                 String ar = sessionConfig != null ? sessionConfig.getAspectRatio() : null;
                 previewView.setScaleType(
                     (ar == null || ar.isEmpty()) ? PreviewView.ScaleType.FIT_CENTER : PreviewView.ScaleType.FILL_CENTER
                 );
 
-                // Set initial zoom if specified, prioritizing targetZoom over default zoomFactor
+                // Apply Zoom
                 float initialZoom = sessionConfig.getTargetZoom() != 1.0f ? sessionConfig.getTargetZoom() : sessionConfig.getZoomFactor();
                 if (initialZoom != 1.0f) {
-                    Log.d(TAG, "Applying initial zoom of " + initialZoom);
-
-                    // Validate zoom is within bounds
-                    if (zoomState != null) {
-                        float minZoom = zoomState.getMinZoomRatio();
-                        float maxZoom = zoomState.getMaxZoomRatio();
-
-                        if (initialZoom < minZoom || initialZoom > maxZoom) {
-                            if (listener != null) {
-                                listener.onCameraStartError(
-                                    "Initial zoom level " +
-                                        initialZoom +
-                                        " is not available. " +
-                                        "Valid range is " +
-                                        minZoom +
-                                        " to " +
-                                        maxZoom
-                                );
-                                return;
-                            }
-                        }
-                    }
-
                     setZoom(initialZoom);
                 }
 
+                // Notify Listener
                 isRunning = true;
-                Log.d(TAG, "bindCameraUseCases: Camera bound successfully");
                 if (listener != null) {
-                    // Post the callback to ensure layout is complete
                     previewContainer.post(() -> {
-                        // Return actual preview container dimensions instead of requested dimensions
-                        // Get the actual camera dimensions and position
-                        int actualWidth = getPreviewWidth();
-                        int actualHeight = getPreviewHeight();
-                        int actualX = getPreviewX();
-                        int actualY = getPreviewY();
-
-                        Log.d(
-                            TAG,
-                            "onCameraStarted callback - actualX=" +
-                                actualX +
-                                ", actualY=" +
-                                actualY +
-                                ", actualWidth=" +
-                                actualWidth +
-                                ", actualHeight=" +
-                                actualHeight
-                        );
-
-                        // Update grid overlay bounds after camera is started
-                        updateGridOverlayBounds();
-
-                        listener.onCameraStarted(actualWidth, actualHeight, actualX, actualY);
+                        listener.onCameraStarted(getPreviewWidth(), getPreviewHeight(), getPreviewX(), getPreviewY());
                     });
                 }
+
             } catch (Exception e) {
+                Log.e(TAG, "Error in bindCameraUseCases", e);
                 if (listener != null) listener.onCameraStartError("Error binding camera: " + e.getMessage());
             }
         });
@@ -1663,10 +1658,9 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
     // we recompress JPEG in-memory and update EXIF info only in the returned JSON, not in the bytes.
 
     public void captureSample(int quality) {
-        captureSampleInternal(quality, bitmap -> bitmap); // No-op processor, returns original
+        captureSampleInternal(quality, null); // null processor = return full image
     }
 
-        // 3. Add captureDownscaledSample implementation
     public void captureDownscaledSample(int quality, int targetMaxSize) {
         captureSampleInternal(quality, original -> {
             int width = original.getWidth();
@@ -1674,7 +1668,7 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
             int smallestSide = Math.min(width, height);
 
             if (smallestSide <= targetMaxSize) {
-                return original; // No need to upscale or resize
+                return original;
             }
 
             float scale = (float) targetMaxSize / (float) smallestSide;
@@ -1685,118 +1679,108 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
         });
     }
 
-    // 4. Add captureCroppedSample implementation
-// Pass the actual View object (e.g., your TextureView or FrameLayout container)
     public void captureCroppedSample(int quality, int x, int y, int reqWidth, int reqHeight) {
-        
-        // 1. Safety Check: Ensure View is laid out
-        if (previewContainer == null || previewView == null) {
-            return;
-        }
-    
-
         captureSampleInternal(quality, original -> {
-            int imgW = original.getWidth();
-            int imgH = original.getHeight();
+            if (previewContainer == null) return original;
 
-            // 2. USE VIEW DIMENSIONS (The viewport)
-            // This matches exactly where the user tapped/dragged
-            float viewW = (float) previewContainer.getWidth();;
+            // 1. Sensor Dimensions (High Res, e.g. 4000x3000)
+            float imgW = (float) original.getWidth();
+            float imgH = (float) original.getHeight();
+
+            // 2. View Dimensions (Screen Res, e.g. 1080x1920)
+            float viewW = (float) previewContainer.getWidth();
             float viewH = (float) previewContainer.getHeight();
 
-            // 3. Calculate Scale (Image pixels per View pixel)
-            float ratioX = (float) imgW / viewW;
-            float ratioY = (float) imgH / viewH;
-            float scale = Math.min(ratioX, ratioY);
+            // 3. Determine Scale Factor
+            // CameraX PreviewView (FILL_CENTER) scales the image so that it fills the view.
+            // It uses the LARGER scale factor to ensure no black bars.
+            // scale = max(viewW / imgW, viewH / imgH) -> This is how much sensor was scaled UP to screen.
+            // We need the reverse: How much to scale Screen Inputs DOWN to Sensor.
 
-            // 4. Center Offsets (Standard Center-Crop logic)
-            float visibleImgW = viewW * scale;
-            float visibleImgH = viewH * scale;
-            
-            float offsetX = (imgW - visibleImgW) / 2f;
-            float offsetY = (imgH - visibleImgH) / 2f;
+            float scaleX = imgW / viewW;
+            float scaleY = imgH / viewH;
 
-            // 5. Map Coordinates
-            int finalX = (int) ((x * scale) + offsetX);
-            int finalY = (int) ((y * scale) + offsetY);
-            int finalW = (int) (reqWidth * scale);
-            int finalH = (int) (reqHeight * scale);
+            // If FILL_CENTER was used, the sensor image was cropped to fit the aspect ratio.
+            // We need to find the "Virtual Viewport" on the sensor.
 
-            // 6. Bounds Checking
-            finalX = Math.max(0, finalX);
-            finalY = Math.max(0, finalY);
-            finalW = Math.min(finalW, imgW - finalX);
-            finalH = Math.min(finalH, imgH - finalY);
+            // Which dimension is the limiting factor?
+            // If sensor is 4:3 (wider) and screen is 16:9 (taller), the sides of sensor are cropped.
 
-            if (finalW <= 0 || finalH <= 0) return original;
+            float sensorCropW, sensorCropH;
+            float scaleFactor;
 
-            return Bitmap.createBitmap(original, finalX, finalY, finalW, finalH);
+            if (scaleX < scaleY) {
+                // The horizontal ratio is smaller, meaning the View is wider relative to image?
+                // Let's calculate logical mapping.
+                // FILL_CENTER logic:
+                // The content is scaled by `max(viewW/imgW, viewH/imgH)` (Zooming in).
+                // Let's work in Sensor Coordinates.
+
+                // Calculate the aspect ratios
+                float sensorAspect = imgW / imgH;
+                float viewAspect = viewW / viewH;
+
+                if (sensorAspect > viewAspect) {
+                    // Sensor is wider than View (e.g. 4:3 vs 9:16)
+                    // Sides are cropped. Height matches.
+                    scaleFactor = imgH / viewH;
+                    sensorCropW = viewW * scaleFactor;
+                    sensorCropH = imgH; // Matches
+                } else {
+                    // Sensor is taller than View (unlikely for landscape sensor) OR
+                    // View is wider than Sensor (e.g. 16:9 Sensor on 21:9 screen)
+                    // Top/Bottom cropped. Width matches.
+                    scaleFactor = imgW / viewW;
+                    sensorCropW = imgW; // Matches
+                    sensorCropH = viewH * scaleFactor;
+                }
+
+                // Calculate Offset (centering)
+                float offsetX = (imgW - sensorCropW) / 2f;
+                float offsetY = (imgH - sensorCropH) / 2f;
+
+                // Map coordinates
+                int finalX = (int) (offsetX + (x * scaleFactor));
+                int finalY = (int) (offsetY + (y * scaleFactor));
+                int finalW = (int) (reqWidth * scaleFactor);
+                int finalH = (int) (reqHeight * scaleFactor);
+
+                // Safety bounds
+                finalX = Math.max(0, finalX);
+                finalY = Math.max(0, finalY);
+                finalW = Math.min(finalW, (int)imgW - finalX);
+                finalH = Math.min(finalH, (int)imgH - finalY);
+
+                if (finalW <= 0 || finalH <= 0) return original;
+
+                return Bitmap.createBitmap(original, finalX, finalY, finalW, finalH);
+            }
+
+            // Fallback for simple scaling if logic ambiguous
+            return original;
         });
     }
 
-    // 5. The Core Internal Method
     private void captureSampleInternal(int quality, BitmapProcessor processor) {
-        if (sampleImageCapture == null) {
-            if (listener != null) listener.onSampleTakenError("Camera not ready");
+        if (imageAnalysis == null) {
+            if (listener != null) listener.onSampleTakenError("Camera not ready (Analysis missing)");
             return;
         }
 
+        // Prevent overlapping requests
         if (IsOperationRunning("captureSample")) {
-            Log.d(TAG, "captureSample: Ignored because operation is running");
+            // If you want to allow burst, you might remove this check,
+            // but "captureNextFrame" logic only handles one at a time.
+            Log.d(TAG, "captureSample skipped: busy");
             return;
         }
 
-        Log.d(TAG, "captureSample: Starting capture");
-
-        try {
-            sampleImageCapture.takePicture(
-                cameraExecutor,
-                new ImageCapture.OnImageCapturedCallback() {
-                    @Override
-                    public void onError(@NonNull ImageCaptureException exception) {
-                        Log.e(TAG, "captureSample: Failed", exception);
-                        if (listener != null) listener.onSampleTakenError(exception.getMessage());
-                        endOperation("captureSample");
-                    }
-
-                    @Override
-                    public void onCaptureSuccess(@NonNull ImageProxy image) {
-                        try {
-                            // 1. Convert ImageProxy to Bitmap (Handling Rotation)
-                            Bitmap bitmap = imageProxyToBitmap(image);
-                            
-                            // 2. Apply the specific logic (Downscale or Crop)
-                            Bitmap finalBitmap = processor.process(bitmap);
-
-                            // 3. Compress to Base64
-                            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                            finalBitmap.compress(Bitmap.CompressFormat.JPEG, quality, outputStream);
-                            byte[] bytes = outputStream.toByteArray();
-                            String base64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
-
-                            // 4. Cleanup
-                            if (bitmap != finalBitmap) bitmap.recycle();
-                            // We don't recycle finalBitmap immediately as GC handles it, 
-                            // but explicit recycling is good practice if memory is tight.
-
-                            if (listener != null) {
-                                listener.onSampleTaken(base64);
-                            }
-                        } catch (Exception e) {
-                            Log.e(TAG, "captureSample: Error processing", e);
-                            if (listener != null) listener.onSampleTakenError(e.getMessage());
-                        } finally {
-                            image.close();
-                            endOperation("captureSample");
-                        }
-                    }
-                }
-            );
-        } catch (Exception e) {
-            Log.e(TAG, "captureSample: Start failed", e);
-            if (listener != null) listener.onSampleTakenError(e.getMessage());
-            endOperation("captureSample");
+        synchronized (analysisLock) {
+            this.pendingQuality = quality;
+            this.pendingProcessor = processor;
+            this.captureNextFrame = true; // Trigger the Analyzer
         }
+        Log.d(TAG, "Snapshot requested via ImageAnalysis");
     }
 
     // 6. Helper to correctly convert ImageProxy to Bitmap with Rotation
