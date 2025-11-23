@@ -1687,14 +1687,13 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
 
     // 4. Add captureCroppedSample implementation
 // Pass the actual View object (e.g., your TextureView or FrameLayout container)
-    public void captureCroppedSample(int quality, int x, int y, int reqWidth, int reqHeight, View previewView) {
+    public void captureCroppedSample(int quality, int x, int y, int reqWidth, int reqHeight) {
         
         // 1. Safety Check: Ensure View is laid out
-        if (previewView == null || previewView.getWidth() == 0) {
-            // If called too early (before layout pass), fall back to screen metrics
-            // or return an error.
-            return; 
+        if (previewContainer == null || previewView == null) {
+            return;
         }
+    
 
         captureSampleInternal(quality, original -> {
             int imgW = original.getWidth();
@@ -1702,8 +1701,8 @@ public class CameraXView implements LifecycleOwner, LifecycleObserver {
 
             // 2. USE VIEW DIMENSIONS (The viewport)
             // This matches exactly where the user tapped/dragged
-            float viewW = (float) previewView.getWidth();
-            float viewH = (float) previewView.getHeight();
+            float viewW = (float) previewContainer.getWidth();;
+            float viewH = (float) previewContainer.getHeight();
 
             // 3. Calculate Scale (Image pixels per View pixel)
             float ratioX = (float) imgW / viewW;

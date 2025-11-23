@@ -373,9 +373,19 @@ public class CameraPreview extends Plugin implements CameraXView.CameraXViewList
             call.reject("Camera is not running");
             return;
         }
+
+        // PREVENT OVERWRITE: Check if a request is already pending
+        if (sampleCallbackId != null) {
+            call.reject("Camera is busy taking a sample");
+            return;
+        }
+
         bridge.saveCall(call);
         sampleCallbackId = call.getCallbackId();
-        Integer quality = Objects.requireNonNull(call.getInt("quality", 85));
+        
+        // Simplify: getInt with default never returns null, no need for Objects.requireNonNull
+        int quality = call.getInt("quality", 85);
+        
         cameraXView.captureSample(quality);
     }
 
@@ -385,13 +395,22 @@ public class CameraPreview extends Plugin implements CameraXView.CameraXViewList
             call.reject("Camera is not running");
             return;
         }
+
+        if (sampleCallbackId != null) {
+            call.reject("Camera is busy taking a sample");
+            return;
+        }
+
         bridge.saveCall(call);
         sampleCallbackId = call.getCallbackId();
         
-        Integer quality = Objects.requireNonNull(call.getInt("quality", 85));
-        Integer size = call.getInt("size", 0);
+        int quality = call.getInt("quality", 85);
+        int size = call.getInt("size", 0);
 
         if (size <= 0) {
+            // Clean up immediately since we aren't proceeding
+            bridge.releaseCall(call);
+            sampleCallbackId = null; 
             call.reject("Invalid size parameter. Must be > 0");
             return;
         }
@@ -405,24 +424,33 @@ public class CameraPreview extends Plugin implements CameraXView.CameraXViewList
             call.reject("Camera is not running");
             return;
         }
+
+        if (sampleCallbackId != null) {
+            call.reject("Camera is busy taking a sample");
+            return;
+        }
+
         bridge.saveCall(call);
         sampleCallbackId = call.getCallbackId();
         
-        Integer quality = Objects.requireNonNull(call.getInt("quality", 85));
+        int quality = call.getInt("quality", 85);
         JSObject coords = call.getObject("coords");
 
         if (coords == null) {
+            bridge.releaseCall(call);
+            sampleCallbackId = null;
             call.reject("Coords object is required");
             return;
         }
 
-        // Extract coordinates safely
         int x = coords.getInteger("x", 0);
         int y = coords.getInteger("y", 0);
         int width = coords.getInteger("width", 0);
         int height = coords.getInteger("height", 0);
 
         if (width <= 0 || height <= 0) {
+            bridge.releaseCall(call);
+            sampleCallbackId = null;
             call.reject("Invalid crop dimensions");
             return;
         }
